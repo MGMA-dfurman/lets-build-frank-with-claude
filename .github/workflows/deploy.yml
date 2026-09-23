@@ -205,14 +205,41 @@ jobs:
             --image "${{ steps.who.outputs.app }}:${{ github.sha }}" \
             --file Dockerfile .
 
+      # One rendered spec, applied to both the create and the update path.
+      #
+      # Why YAML and not flags: ADR-004 requires a `GET /healthz` health probe
+      # and ADR-006 keeps that decision in force, but `az containerapp
+      # create|update` has NO probe flag — `--yaml` is the only way to set one,
+      # and with `--yaml` "all other parameters will be ignored". So it is all
+      # flags or all document; it cannot be flags plus a probe.
+      #
+      # What the missing probe cost: the Dockerfile's HEALTHCHECK is not used by
+      # Container Apps (it says so itself), so the platform fell back to TCP
+      # probing the ingress port. A Frank that binds 3000 but cannot serve /mcp —
+      # a bad env var, a failed tool import — deployed green and only failed when
+      # a student connected.
       - name: Create or update the Container App
         run: |
           set -euo pipefail
           APP="${{ steps.who.outputs.app }}"
           RG="$AZURE_RESOURCE_GROUP"
           ACR="${{ steps.who.outputs.acr }}"
-          IMAGE="${{ steps.who.outputs.image }}"
+          ENV_NAME="${{ steps.who.outputs.env }}"
+
           SUB=$(az account show --query id -o tsv)
+          ENV_ID=$(az containerapp env show -g "$RG" -n "$ENV_NAME" --query id -o tsv)
+          LOCATION=$(az containerapp env show -g "$RG" -n "$ENV_NAME" --query location -o tsv)
+
+          # The registry admin user must be enabled for this to return anything.
+          # It is a precondition of the shared registry, not of your fork, so say
+          # so plainly rather than letting `az containerapp create` fail later
+          # with an authentication error that points at the wrong thing.
+          ACR_PW=$(az acr credential show --name "$ACR" --query 'passwords[0].value' -o tsv 2>/dev/null) || ACR_PW=""
+          if [ -z "$ACR_PW" ]; then
+            echo "::error::Could not read credentials for registry $ACR. Its admin user is probably disabled - ask your instructor to run 'az acr update -n $ACR --admin-enabled true'."
+            exit 1
+          fi
+          echo "::add-mask::$ACR_PW"
 
           # Frank's Azure-reading tools (ADR-009) need to know WHICH resource group
           # he is in. There is deliberately no tool parameter for it — the scope is
@@ -225,28 +252,209 @@ jobs:
           CID=$(printf '%s' "$CREDS" | python3 -c 'import json,sys;print(json.load(sys.stdin)["clientId"])')
           CSECRET=$(printf '%s' "$CREDS" | python3 -c 'import json,sys;print(json.load(sys.stdin)["clientSecret"])')
           TEN=$(printf '%s' "$CREDS" | python3 -c 'import json,sys;print(json.load(sys.stdin)["tenantId"])')
-          ENVVARS="AZURE_SUBSCRIPTION_ID=$SUB AZURE_RESOURCE_GROUP=$RG AZURE_CLIENT_ID=$CID AZURE_TENANT_ID=$TEN AZURE_CLIENT_SECRET=secretref:azure-client-secret"
-          SECRETS="azure-client-secret=$CSECRET"
+
+          # Rendered outside the workspace, mode 600, and removed however this
+          # step exits: it holds the registry password and the client secret in
+          # plaintext for as long as the two az calls below take.
+          SPEC="$RUNNER_TEMP/frank-app.yaml"
+          trap 'rm -f "$SPEC"' EXIT
+          ( umask 077
+            APP="$APP" IMAGE="${{ steps.who.outputs.image }}" ENV_ID="$ENV_ID" LOCATION="$LOCATION" \
+            ACR_SERVER="$ACR.azurecr.io" ACR_USER="$ACR" ACR_PW="$ACR_PW" \
+            SUB="$SUB" RG="$RG" CID="$CID" TEN="$TEN" CSECRET="$CSECRET" \
+            python3 - "$SPEC" <<'PY'
+          import json, os, sys
+
+          # Hard limits from the Container Apps REST spec (ContainerAppProbe in
+          # CommonDefinitions.json). The conceptual docs contradict these — they
+          # show a Startup "default" failureThreshold of 240 and an example using
+          # 48 — but those are platform-injected defaults, not values the API
+          # accepts from you. Exceeding a limit is rejected at deploy time, so it
+          # is caught here instead, where the error names the field.
+          PROBE_LIMITS = {
+              "initialDelaySeconds": 60,
+              "periodSeconds": 240,
+              "timeoutSeconds": 240,
+              "failureThreshold": 10,
+          }
+
+          def probe(kind, initial_delay, period, failures):
+              # Every probe hits the same endpoint ADR-001 specifies.
+              spec = {
+                  "type": kind,
+                  "httpGet": {"path": "/healthz", "port": 3000},
+                  "initialDelaySeconds": initial_delay,
+                  "periodSeconds": period,
+                  "timeoutSeconds": 3,
+                  "failureThreshold": failures,
+              }
+              for field, maximum in PROBE_LIMITS.items():
+                  value = spec[field]
+                  if not 1 <= value <= maximum:
+                      raise SystemExit(
+                          f"{kind} probe: {field}={value} is outside the "
+                          f"Container Apps range 1..{maximum}"
+                      )
+              return spec
+
+          spec = {
+              "location": os.environ["LOCATION"],
+              "properties": {
+                  "environmentId": os.environ["ENV_ID"],
+                  "configuration": {
+                      "activeRevisionsMode": "Single",
+                      "ingress": {"external": True, "targetPort": 3000, "transport": "auto"},
+                      "registries": [{
+                          "server": os.environ["ACR_SERVER"],
+                          "username": os.environ["ACR_USER"],
+                          "passwordSecretRef": "acr-password",
+                      }],
+                      "secrets": [
+                          {"name": "acr-password", "value": os.environ["ACR_PW"]},
+                          {"name": "azure-client-secret", "value": os.environ["CSECRET"]},
+                      ],
+                  },
+                  "template": {
+                      "containers": [{
+                          "name": "frank",
+                          "image": os.environ["IMAGE"],
+                          "env": [
+                              {"name": "AZURE_SUBSCRIPTION_ID", "value": os.environ["SUB"]},
+                              {"name": "AZURE_RESOURCE_GROUP", "value": os.environ["RG"]},
+                              {"name": "AZURE_CLIENT_ID", "value": os.environ["CID"]},
+                              {"name": "AZURE_TENANT_ID", "value": os.environ["TEN"]},
+                              {"name": "AZURE_CLIENT_SECRET", "secretRef": "azure-client-secret"},
+                          ],
+                          # Startup gets the longest budget because min-replicas
+                          # is 0 and a replica booting from cold must answer
+                          # before the platform gives up on it: 10s delay plus
+                          # 10 attempts at 15s is about 160 seconds. That is the
+                          # most the API allows, since failureThreshold caps at
+                          # 10. Note the budget covers process start only —
+                          # probes begin after the container starts, so pulling
+                          # the image does not eat into it.
+                          "probes": [
+                              probe("Startup", 10, 15, 10),
+                              probe("Readiness", 3, 10, 3),
+                              probe("Liveness", 10, 30, 3),
+                          ],
+                      }],
+                      "scale": {"minReplicas": 0, "maxReplicas": 1},
+                  },
+              },
+          }
+
+          # JSON is valid YAML, and json.dump cannot mis-quote a secret that
+          # happens to contain a colon, a quote or a leading dash.
+          with open(sys.argv[1], "w", encoding="utf-8") as handle:
+              json.dump(spec, handle, indent=2)
+          PY
+          )
 
           if az containerapp show --name "$APP" --resource-group "$RG" >/dev/null 2>&1; then
             echo "updating existing app"
-            az containerapp secret set --name "$APP" --resource-group "$RG" --secrets $SECRETS -o none
-            az containerapp update --name "$APP" --resource-group "$RG" --image "$IMAGE" \
-              --set-env-vars $ENVVARS
+            az containerapp update --name "$APP" --resource-group "$RG" --yaml "$SPEC" -o none
           else
             echo "creating app"
-            PW=$(az acr credential show --name "$ACR" --query 'passwords[0].value' -o tsv)
-            az containerapp create \
-              --name "$APP" --resource-group "$RG" \
-              --environment "${{ steps.who.outputs.env }}" \
-              --image "$IMAGE" \
-              --target-port 3000 --ingress external \
-              --registry-server "$ACR.azurecr.io" \
-              --registry-username "$ACR" --registry-password "$PW" \
-              --min-replicas 0 --max-replicas 1 \
-              --secrets $SECRETS \
-              --env-vars $ENVVARS
+            az containerapp create --name "$APP" --resource-group "$RG" --yaml "$SPEC" -o none
           fi
+
+      # The probe is only worth adding if a broken one fails the build. This
+      # checks the deployed revision, not a local container.
+      - name: Verify the deployed revision is healthy
+        run: |
+          set -euo pipefail
+          APP="${{ steps.who.outputs.app }}"
+          RG="$AZURE_RESOURCE_GROUP"
+
+          # Assert the SHAPE of the probes, not how many there are. A default TCP
+          # probe, a probe on the wrong path, or three copies of one type would
+          # all satisfy a >= 1 count while failing to check what ADR-004 asks for.
+          # Parsed in python because JMESPath length() errors rather than
+          # returning 0 when there are no probes — the exact state to catch.
+          # Via a heredoc and a file, not `python3 -c '...'`: inside a
+          # single-quoted shell string a backslash stays literal, so an escaped
+          # quote in the Python becomes a syntax error that `bash -n` cannot see
+          # and only the runner discovers.
+          az containerapp show --name "$APP" --resource-group "$RG" \
+            --query "properties.template.containers[0].probes" -o json > "$RUNNER_TEMP/probes.json"
+          python3 - "$RUNNER_TEMP/probes.json" <<'PY'
+          import json, sys
+
+          probes = json.load(open(sys.argv[1], encoding="utf-8")) or []
+          found = {}
+          for entry in probes:
+              found.setdefault(entry.get("type"), []).append(entry)
+
+          problems = []
+          for kind in ("Startup", "Readiness", "Liveness"):
+              matching = found.get(kind, [])
+              if len(matching) != 1:
+                  problems.append(f"expected exactly one {kind} probe, found {len(matching)}")
+                  continue
+              http = matching[0].get("httpGet") or {}
+              path = http.get("path")
+              port = http.get("port")
+              if path != "/healthz" or port != 3000:
+                  problems.append(f"{kind} probe targets {path}:{port}, expected /healthz:3000")
+
+          if problems:
+              print("::error::Deployed probes do not satisfy ADR-004: " + "; ".join(problems))
+              sys.exit(1)
+          print(f"deployed revision declares {len(probes)} probes, all on /healthz:3000")
+          PY
+
+          # `show` returns the DESIRED template, so the checks above can pass
+          # while the old revision is still the one serving traffic. In single
+          # revision mode traffic only shifts once readiness succeeds, so wait
+          # for the newest revision to actually be the ready one before believing
+          # anything the FQDN says.
+          DEADLINE=$(( $(date +%s) + 600 ))
+          while :; do
+            read -r LATEST READY <<<"$(az containerapp show --name "$APP" --resource-group "$RG" \
+              --query '[properties.latestRevisionName, properties.latestReadyRevisionName]' -o tsv)"
+            if [ -n "${LATEST:-}" ] && [ "$LATEST" = "${READY:-}" ]; then
+              echo "revision $LATEST is the latest ready revision"
+              break
+            fi
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::error::Revision $LATEST never became ready (latest ready: ${READY:-none}). Its readiness probe is failing: az containerapp logs show -n $APP -g $RG"
+              exit 1
+            fi
+            echo "waiting for $LATEST to become ready (currently ready: ${READY:-none})"
+            sleep 10
+          done
+
+          FQDN=$(az containerapp show --name "$APP" --resource-group "$RG" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+
+          # Deadline-based rather than a fixed attempt count: 30 attempts that
+          # each spend up to 15s in curl and then sleep 10s is 12 minutes, not
+          # the 5 it looks like. Scale-to-zero means the first request also pays
+          # the cold start, so some retrying is still required.
+          DEADLINE=$(( $(date +%s) + 300 ))
+          attempt=0
+          while :; do
+            attempt=$((attempt + 1))
+            # `curl || echo 000` appends to the code curl already printed, giving
+            # "000000" on a timeout. Capture the exit status separately instead.
+            if CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://$FQDN/healthz"); then
+              :
+            else
+              CODE=000
+            fi
+            if [ "$CODE" = "200" ]; then
+              echo "healthz answered 200 on attempt $attempt"
+              exit 0
+            fi
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              break
+            fi
+            echo "attempt $attempt: healthz returned $CODE"
+            sleep 5
+          done
+          echo "::error::Frank deployed but never answered 200 on /healthz. Check the container logs: az containerapp logs show -n $APP -g $RG"
+          exit 1
 
       - name: Show Frank's URL
         run: |
